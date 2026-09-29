@@ -10,36 +10,173 @@ code lives inside that class so it is easy to explain to judges.
 """
 
 import logging
+import inspect
+import json
+import math
 import os
-from datetime import datetime
+import base64
+import secrets
+import threading
+import time
+import uuid
+from collections import deque
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-log = logging.getLogger("dealbrief")
-
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# Environment variables — never hardcoded
-HINDSIGHT_BASE_URL: str = os.getenv("HINDSIGHT_BASE_URL", "https://api.hindsight.vectorize.io")
-HINDSIGHT_API_KEY: str = os.getenv("HINDSIGHT_API_KEY", "")
-HINDSIGHT_BANK_ID: str = os.getenv("HINDSIGHT_BANK_ID", "dealbrief-ai")
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+if APP_ENV not in {"development", "production"}:
+    raise RuntimeError("APP_ENV must be either 'development' or 'production'.")
 
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-# Default to a reliable Groq production model.  Override in .env if needed.
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+HINDSIGHT_BASE_URL = os.getenv("HINDSIGHT_BASE_URL", "https://api.hindsight.vectorize.io").rstrip("/")
+HINDSIGHT_API_KEY = os.getenv("HINDSIGHT_API_KEY", "").strip()
+HINDSIGHT_BANK_ID = os.getenv("HINDSIGHT_BANK_ID", "dealbrief-ai").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+if APP_ENV == "production":
+    missing = [name for name, value in (
+        ("GROQ_API_KEY", GROQ_API_KEY),
+        ("ALLOWED_ORIGINS", os.getenv("ALLOWED_ORIGINS", "").strip()),
+        ("APP_USERNAME", APP_USERNAME),
+        ("APP_PASSWORD", APP_PASSWORD),
+    ) if not value]
+    if missing:
+        raise RuntimeError("Missing required production configuration: " + ", ".join(missing))
+    if len(APP_PASSWORD) < 16:
+        raise RuntimeError("APP_PASSWORD must be at least 16 characters in production.")
+
+_origins_value = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [origin.strip().rstrip("/") for origin in _origins_value.split(",") if origin.strip()]
+if APP_ENV == "development" and not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = [
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:8000", "http://127.0.0.1:8000",
+    ]
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError("ALLOWED_ORIGINS must list explicit origins; wildcard origins are not allowed.")
+for origin in ALLOWED_ORIGINS:
+    parsed_origin = urlsplit(origin)
+    if (
+        parsed_origin.scheme not in {"http", "https"}
+        or not parsed_origin.netloc
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+        or parsed_origin.username
+        or parsed_origin.password
+    ):
+        raise RuntimeError("ALLOWED_ORIGINS must contain only HTTP(S) origins without paths.")
+    if APP_ENV == "production" and parsed_origin.scheme != "https":
+        raise RuntimeError("ALLOWED_ORIGINS must use HTTPS in production.")
+
+_hindsight_url = urlsplit(HINDSIGHT_BASE_URL)
+if (
+    _hindsight_url.scheme not in {"http", "https"}
+    or not _hindsight_url.netloc
+    or _hindsight_url.username
+    or _hindsight_url.password
+    or _hindsight_url.query
+    or _hindsight_url.fragment
+):
+    raise RuntimeError("HINDSIGHT_BASE_URL must be an absolute HTTP(S) URL.")
+if APP_ENV == "production" and _hindsight_url.scheme != "https":
+    raise RuntimeError("HINDSIGHT_BASE_URL must use HTTPS in production.")
+
+def _positive_float(name: str, default: str) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number.") from exc
+    if not math.isfinite(value) or value <= 0 or value > 300:
+        raise RuntimeError(f"{name} must be greater than 0 and no more than 300 seconds.")
+    return value
+
+
+def _positive_int(name: str, default: str) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if value < 1024 or value > 10 * 1024 * 1024:
+        raise RuntimeError(f"{name} must be between 1024 and 10485760 bytes.")
+    return value
+
+
+HINDSIGHT_TIMEOUT_SECONDS = _positive_float("HINDSIGHT_TIMEOUT_SECONDS", "15")
+GROQ_TIMEOUT_SECONDS = _positive_float("GROQ_TIMEOUT_SECONDS", "30")
+MAX_REQUEST_BODY_BYTES = _positive_int("MAX_REQUEST_BODY_BYTES", "65536")
+
+_request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "request_id": _request_id.get(),
+            "message": record.getMessage(),
+        }, ensure_ascii=True)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+log = logging.getLogger("dealbrief")
+
+
+class ExternalServiceError(Exception):
+    def __init__(self, message: str, status_code: int = 503) -> None:
+        super().__init__(message)
+        self.public_message = message
+        self.status_code = status_code
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        received_bytes = 0
+
+        async def limited_receive():
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_bytes:
+                    raise HTTPException(status_code=413, detail="Request body is too large.")
+            return message
+
+        await self.app(scope, limited_receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -48,26 +185,27 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 class InteractionRequest(BaseModel):
     """Structured sales interaction to store in Hindsight memory."""
-    prospect: str = Field(min_length=2, description="Prospect's first/full name")
-    company: str = Field(min_length=2, description="Prospect's company name")
+    prospect: str = Field(min_length=2, max_length=120, description="Prospect's first/full name")
+    company: str = Field(min_length=2, max_length=160, description="Prospect's company name")
     # Optional rich fields — all folded into a natural-language memory string
-    summary: str = Field(default="", description="High-level meeting summary")
-    requirements: str = Field(default="", description="What the prospect needs")
-    objections: str = Field(default="", description="Concerns or blockers raised")
-    budget: str = Field(default="", description="Budget information")
-    competitors: str = Field(default="", description="Competing products mentioned")
-    stakeholders: str = Field(default="", description="Other people involved")
-    commitments: str = Field(default="", description="What was promised / next steps")
-    meeting_type: str = Field(default="", description="Discovery / Demo / Follow-up / etc.")
-    date: str = Field(default="", description="Meeting date (free text, e.g. 2026-09-27)")
+    summary: str = Field(default="", max_length=5000, description="High-level meeting summary")
+    requirements: str = Field(default="", max_length=3000, description="What the prospect needs")
+    objections: str = Field(default="", max_length=3000, description="Concerns or blockers raised")
+    budget: str = Field(default="", max_length=1000, description="Budget information")
+    competitors: str = Field(default="", max_length=1000, description="Competing products mentioned")
+    stakeholders: str = Field(default="", max_length=2000, description="Other people involved")
+    commitments: str = Field(default="", max_length=3000, description="What was promised / next steps")
+    meeting_type: str = Field(default="", max_length=100, description="Discovery / Demo / Follow-up / etc.")
+    date: str = Field(default="", max_length=40, description="Meeting date (free text, e.g. 2026-09-27)")
 
 
 class BriefRequest(BaseModel):
     """Generate a personalized DealBrief for a prospect."""
-    prospect: str = Field(min_length=2)
-    company: str = Field(default="", description="Company name (helps scope recall)")
+    prospect: str = Field(min_length=2, max_length=120)
+    company: str = Field(default="", max_length=160, description="Company name (helps scope recall)")
     question: str = Field(
         default="What should I know before my next call?",
+        max_length=2000,
         description="What the salesperson wants to know",
     )
 
@@ -96,14 +234,19 @@ class MemoryService:
 
         try:
             from hindsight_client import Hindsight  # type: ignore
-            self._client = Hindsight(
-                base_url=HINDSIGHT_BASE_URL,
-                api_key=HINDSIGHT_API_KEY,
-            )
+            client_options = {"base_url": HINDSIGHT_BASE_URL, "api_key": HINDSIGHT_API_KEY}
+            try:
+                if "timeout" in inspect.signature(Hindsight).parameters:
+                    client_options["timeout"] = HINDSIGHT_TIMEOUT_SECONDS
+                if "max_attempts" in inspect.signature(Hindsight).parameters:
+                    client_options["max_attempts"] = 1
+            except (TypeError, ValueError):
+                pass
+            self._client = Hindsight(**client_options)
             self._available = True
-            log.info("Hindsight client initialised (bank: %s)", HINDSIGHT_BANK_ID)
+            log.info("Hindsight client initialised")
         except Exception as exc:
-            log.error("Failed to initialise Hindsight client: %s", exc)
+            log.error("Hindsight client initialisation failed error_type=%s", type(exc).__name__)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -124,14 +267,14 @@ class MemoryService:
                     "everything relevant before their next call."
                 ),
             )
-            log.info("Memory bank created: %s", HINDSIGHT_BANK_ID)
+            log.info("Hindsight memory bank created")
         except Exception as exc:
             # Bank already existing is expected — that's fine.
             already_msg = str(exc).lower()
             if "already" in already_msg or "exist" in already_msg or "409" in already_msg:
-                log.debug("Memory bank already exists: %s", HINDSIGHT_BANK_ID)
+                log.debug("Memory bank already exists")
             else:
-                log.warning("create_bank warning (non-fatal): %s", exc)
+                log.warning("Hindsight bank creation failed error_type=%s", type(exc).__name__)
         self._bank_ensured = True
 
     @staticmethod
@@ -213,7 +356,7 @@ class MemoryService:
                 ),
                 tags=tags,
             )
-            log.info("Retained interaction for %s / %s in Hindsight", interaction.prospect, interaction.company)
+            log.info("Retained sales interaction in Hindsight")
             return {
                 "source": "hindsight",
                 "message": f"Interaction retained in Hindsight memory (bank: {HINDSIGHT_BANK_ID}).",
@@ -221,7 +364,7 @@ class MemoryService:
             }
         except Exception as exc:
             err_msg = str(exc)
-            log.warning("Hindsight retain error: %s", err_msg)
+            log.warning("Hindsight retain failed error_type=%s", type(exc).__name__)
             # Store locally so user can still test LLM generation, but explicitly mark source as demo/fallback
             _DEMO_STORE.append({
                 "prospect": interaction.prospect.lower(),
@@ -232,12 +375,12 @@ class MemoryService:
             if "402" in err_msg or "credit" in err_msg.lower():
                 return {
                     "source": "demo",
-                    "message": "Hindsight API: Insufficient credits (402 Payment Required). Stored in local fallback so Groq DealBrief generation can proceed.",
+                    "message": "Hindsight is temporarily unavailable. Interaction stored in local fallback.",
                     "stored_text": text,
                 }
             return {
                 "source": "demo",
-                "message": f"Hindsight error ({err_msg}). Stored in local fallback.",
+                "message": "Hindsight is temporarily unavailable. Interaction stored in local fallback.",
                 "stored_text": text,
             }
 
@@ -305,12 +448,10 @@ class MemoryService:
                     "tags": item.tags or [],
                 })
 
-            log.info(
-                "Recalled %d memories for %s from Hindsight", len(memories), prospect
-            )
+            log.info("Recalled %d memories from Hindsight", len(memories))
             return memories, "hindsight"
         except Exception as exc:
-            log.warning("Hindsight recall error (%s), using local fallback store", exc)
+            log.warning("Hindsight recall failed error_type=%s; using local fallback", type(exc).__name__)
             results = []
             for item in _DEMO_STORE:
                 if prospect.lower() in item["prospect"]:
@@ -372,7 +513,7 @@ class MemoryService:
 # ---------------------------------------------------------------------------
 # Demo memory fallback (only used when Hindsight is not configured)
 # ---------------------------------------------------------------------------
-_DEMO_STORE: list[dict] = []
+_DEMO_STORE: deque[dict] = deque(maxlen=500)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +612,7 @@ Base every claim on the recalled memories. Flag anything you are inferring rathe
 
     try:
         from groq import Groq  # type: ignore
-        client = Groq(api_key=GROQ_API_KEY)
+        client = Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT_SECONDS, max_retries=0)
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             temperature=0.2,
@@ -482,11 +623,18 @@ Base every claim on the recalled memories. Flag anything you are inferring rathe
             ],
         )
         brief_text = response.choices[0].message.content
+        if not isinstance(brief_text, str) or not brief_text.strip():
+            raise ExternalServiceError("Groq returned an empty response.", 503)
         log.info("Generated DealBrief via Groq (%s)", GROQ_MODEL)
         return brief_text, "groq"
     except Exception as exc:
-        log.error("Groq error: %s", exc)
-        raise RuntimeError(f"Groq API error: {exc}") from exc
+        if isinstance(exc, ExternalServiceError):
+            raise
+        status_code = getattr(exc, "status_code", None)
+        log.error("Groq request failed error_type=%s status_code=%s", type(exc).__name__, status_code)
+        if status_code == 429:
+            raise ExternalServiceError("Groq rate limit reached. Please try again shortly.", 429) from exc
+        raise ExternalServiceError("Groq is temporarily unavailable. Please try again shortly.", 503) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +646,98 @@ app = FastAPI(
     description="Memory-powered sales intelligence agent (Hindsight + Groq)",
     version="1.0.0",
 )
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    max_age=600,
+)
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_buckets: dict[str, deque[float]] = {}
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=400, content={"detail": "Invalid request input."})
+
+
+@app.exception_handler(ExternalServiceError)
+async def external_service_error_handler(request: Request, exc: ExternalServiceError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.public_message})
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception):
+    log.error("Unhandled request error error_type=%s", type(exc).__name__)
+    return JSONResponse(status_code=500, content={"detail": "An unexpected server error occurred."})
+
+
+@app.middleware("http")
+async def request_safety_middleware(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    token = _request_id.set(request_id)
+    response = None
+    try:
+        if APP_ENV == "production" and request.url.path != "/health":
+            credentials = base64.b64encode(f"{APP_USERNAME}:{APP_PASSWORD}".encode()).decode("ascii")
+            supplied = request.headers.get("authorization", "")
+            if not secrets.compare_digest(supplied, f"Basic {credentials}"):
+                response = JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required."},
+                    headers={"WWW-Authenticate": 'Basic realm="DealBrief AI", charset="UTF-8"'},
+                )
+
+        content_length = request.headers.get("content-length")
+        if response is None and content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY_BYTES:
+            response = JSONResponse(status_code=413, content={"detail": "Request body is too large."})
+        elif response is None and request.url.path.startswith("/api/") and request.method != "OPTIONS":
+            client_host = request.client.host if request.client else "unknown"
+            now = time.monotonic()
+            with _rate_limit_lock:
+                bucket = _rate_limit_buckets.setdefault(client_host, deque())
+                while bucket and bucket[0] <= now - 60:
+                    bucket.popleft()
+                if len(_rate_limit_buckets) > 10000:
+                    for address, timestamps in list(_rate_limit_buckets.items()):
+                        while timestamps and timestamps[0] <= now - 60:
+                            timestamps.popleft()
+                        if not timestamps:
+                            _rate_limit_buckets.pop(address, None)
+                if len(bucket) >= 30:
+                    response = JSONResponse(status_code=429, content={"detail": "Too many requests. Please try again shortly."})
+                else:
+                    bucket.append(now)
+
+        if response is None:
+            response = await call_next(request)
+
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        )
+        if APP_ENV == "production":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+        route = request.scope.get("route")
+        route_name = getattr(route, "path", "unmatched")
+        log.info("request method=%s route=%s status=%s", request.method, route_name, response.status_code)
+        return response
+    except Exception as exc:
+        log.error("Request middleware failed error_type=%s", type(exc).__name__)
+        raise
+    finally:
+        _request_id.reset(token)
 
 # Serve static files at /static/*
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -516,6 +756,11 @@ def home():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "dealbrief-ai"}
+
+
 @app.get("/api/health")
 def health():
     """
@@ -526,8 +771,6 @@ def health():
     return {
         "status": "ok",
         "hindsight_configured": bool(HINDSIGHT_API_KEY),
-        "hindsight_base_url": HINDSIGHT_BASE_URL if HINDSIGHT_API_KEY else None,
-        "hindsight_bank_id": HINDSIGHT_BANK_ID,
         "hindsight_connected": _memory.available,
         "groq_configured": bool(GROQ_API_KEY),
         "groq_model": GROQ_MODEL if GROQ_API_KEY else None,
@@ -551,8 +794,8 @@ def add_interaction(interaction: InteractionRequest):
             "company": interaction.company,
         }
     except Exception as exc:
-        log.error("retain error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Memory retain error: {exc}")
+        log.error("Interaction retain failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Memory service is temporarily unavailable.") from exc
 
 
 @app.post("/api/brief")
@@ -586,9 +829,11 @@ def generate_deal_brief(request: BriefRequest):
             "llm_model": GROQ_MODEL if llm_source == "groq" else None,
             "hindsight_bank": HINDSIGHT_BANK_ID,
         }
+    except ExternalServiceError:
+        raise
     except Exception as exc:
-        log.error("brief error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Agent error: {exc}")
+        log.error("Brief generation failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="DealBrief generation failed.") from exc
 
 
 @app.get("/api/memories/{prospect}")
@@ -614,8 +859,8 @@ def get_memories(prospect: str, company: str = ""):
             "hindsight_bank": HINDSIGHT_BANK_ID,
         }
     except Exception as exc:
-        log.error("memory recall error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Memory error: {exc}")
+        log.error("Memory recall failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Memory service is temporarily unavailable.") from exc
 
 
 @app.post("/api/demo/seed")
@@ -737,7 +982,8 @@ def seed_demo():
                 "source": result["source"],
             })
         except Exception as exc:
-            errors.append(str(exc))
+            log.error("Demo seed retain failed error_type=%s", type(exc).__name__)
+            errors.append(type(exc).__name__)
 
     return {
         "ok": len(errors) == 0,

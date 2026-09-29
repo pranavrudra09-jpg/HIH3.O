@@ -48,7 +48,7 @@ This is exactly the hackathon theme: **AI Agents That Learn Using Hindsight**.
 Salesperson (browser)
         │
         ▼
-  FastAPI (app.py)
+  FastAPI (app.main:app; existing implementation in app.py)
         │
    ┌────┴────┐
    │         │
@@ -118,10 +118,10 @@ GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
-### 5. Run
+### 5. Run in development
 
 ```powershell
-.venv\Scripts\python.exe -m uvicorn app:app --reload --port 8000
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
 Open **http://127.0.0.1:8000**
@@ -137,15 +137,22 @@ Open **http://127.0.0.1:8000**
 | `HINDSIGHT_BANK_ID` | Memory bank namespace | No (default: `dealbrief-ai`) |
 | `GROQ_API_KEY` | Your Groq API key | Yes (for AI brief) |
 | `GROQ_MODEL` | Groq model ID | No (default: `llama-3.3-70b-versatile`) |
+| `APP_ENV` | `development` or `production` | No (default: `development`) |
+| `ALLOWED_ORIGINS` | Comma-separated frontend origins; no paths or wildcards | Required in production |
+| `APP_USERNAME` | HTTP Basic username for the production UI and API | Required in production |
+| `APP_PASSWORD` | HTTP Basic password (minimum 16 characters in production) | Required in production |
+| `GROQ_TIMEOUT_SECONDS` | Maximum Groq request duration | No (default: 30) |
+| `HINDSIGHT_TIMEOUT_SECONDS` | Hindsight client timeout when supported by its installed SDK | No (default: 15) |
+| `MAX_REQUEST_BODY_BYTES` | Maximum accepted request body size | No (default: 65536) |
 
-The app runs in **demo mode** if credentials are missing — UI loads, endpoints work, but memory is local-only and briefs are template-based.
+Hindsight remains optional, matching the existing fallback behavior. Without it, interactions are kept in a bounded, in-memory local fallback and are lost when the process restarts. Without Groq, development mode uses the existing deterministic demo brief. Production mode requires `GROQ_API_KEY`, explicit origins, and HTTP Basic credentials. Never use the development defaults for an internet-facing deployment.
 
 ---
 
 ## API Endpoints
 
 ### `GET /api/health`
-Returns configuration status. Never exposes API keys.
+Returns UI configuration status. It does not expose credentials, provider URLs, or bank identifiers.
 
 ```json
 {
@@ -157,6 +164,13 @@ Returns configuration status. Never exposes API keys.
   "groq_model": "llama-3.3-70b-versatile",
   "mode": "live"
 }
+```
+
+### `GET /health`
+Minimal public liveness endpoint:
+
+```json
+{"status":"healthy","service":"dealbrief-ai"}
 ```
 
 ### `POST /api/interactions`
@@ -286,16 +300,52 @@ Log a new interaction (e.g., Rahul agreed to a pilot). Click Save to Memory. Cli
 
 ```
 dealbrief-ai/
-├── app.py              # FastAPI app + MemoryService + LLM logic
+├── app.py              # Existing FastAPI app + MemoryService + Groq logic
+├── app/
+│   ├── __init__.py
+│   └── main.py          # Stable app.main:app ASGI entrypoint
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Environment variable template
 ├── .gitignore          # Ignores .env and .venv
+├── Dockerfile
+├── .dockerignore
 ├── README.md           # This file
 └── static/
     ├── index.html      # Single-page app
     ├── style.css       # Dark SaaS aesthetic
     └── app.js          # Frontend logic
+
+  ---
+
+  ## Production Deployment
+
+  Use Python 3.12 or newer, install `requirements.txt`, and provide production configuration through the deployment environment or a local `.env` file that is never committed. Set `APP_ENV=production`, `GROQ_API_KEY`, `APP_USERNAME`, `APP_PASSWORD` (at least 16 characters), and `ALLOWED_ORIGINS` to the exact HTTPS frontend origin. Hindsight credentials are optional; set `HINDSIGHT_API_KEY` to enable persistent memory.
+
+  Run the production server without reload:
+
+  ```powershell
+  python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
+  ```
+
+  Build and run the Docker image from this directory:
+
+  ```powershell
 ```
+  docker run --rm -p 8000:8000 --env-file .env dealbrief-ai:latest
+  ```
+
+  The container runs as a non-root user. Terminate TLS at a reverse proxy or managed ingress and keep that proxy in front of the app; HTTP Basic credentials must only travel over HTTPS. `/health` is public and reveals only service status. The app has no user/tenant database or persistent local store, so use an identity-aware gateway and managed persistent storage before exposing it to multiple customers. CORS is an origin policy, not authentication.
+
+  Check the service with `GET http://127.0.0.1:8000/health`. Request bodies are bounded, API traffic is rate-limited per source IP in each worker, and response errors omit provider exception details. Rate limits are process-local; use gateway rate limiting for multi-worker or distributed deployments.
+
+  ### Troubleshooting
+
+  - `Missing required production configuration` means one or more production variables listed above are absent.
+  - HTTP 401 indicates missing or incorrect HTTP Basic credentials; configure them at the browser prompt and verify TLS is enabled.
+  - HTTP 429 indicates the app or provider rate limit was reached; wait and retry, or configure an upstream gateway limit for scaled deployments.
+  - A `demo` memory source means Hindsight is not configured/available; the local fallback is volatile and limited to the current process.
+  - A 503 from brief generation means Groq or another external dependency is unavailable; check server logs by request ID without logging credentials or prompts.
+  - The startup warning that Hindsight is unavailable can also indicate that `hindsight-client` is not installed or its credentials/client configuration are invalid.
 
 ---
 
