@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DealBrief AI — Sales Intelligence That Remembers</title>
+  <meta name="description" content="AI sales intelligence agent powered by Hindsight persistent memory. Log interactions, recall history, generate personalized DealBriefs." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ════════════════════════════ HEADER ════════════════════════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo-mark">
+        <span class="logo-icon">✦</span>
+      </div>
+      <div class="brand-text">
+        <strong>DealBrief AI</strong>
+        <span class="brand-sub">Sales intelligence that remembers</span>
+      </div>
+    </div>
+
+    <nav class="topbar-nav">
+      <div id="statusBadge" class="status-badge" title="System status">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Checking…</span>
+      </div>
+      <button id="seedBtn" class="btn-ghost" title="Load 3 realistic demo interactions for Rahul Sharma / Acme Technologies">
+        ⚡ Seed Demo Data
+      </button>
+    </nav>
+  </header>
+
+  <div class="app-shell">
+
+    <!-- ════════════════════════ LEFT SIDEBAR ════════════════════════ -->
+    <aside class="sidebar">
+
+      <!-- Section header -->
+      <div class="panel-header">
+        <div class="section-number">01</div>
+        <div>
+          <h2 class="panel-title-text">Log Interaction</h2>
+          <p class="panel-subtitle">Retain to Hindsight memory</p>
+        </div>
+      </div>
+
+      <form id="interactionForm" class="interaction-form" novalidate>
+        <div class="field-row">
+          <div class="field">
+            <label for="prospect">Prospect name</label>
+            <input id="prospect" type="text" value="Rahul Sharma" placeholder="e.g. Rahul Sharma" required />
+          </div>
+          <div class="field">
+            <label for="company">Company</label>
+            <input id="company" type="text" value="Acme Technologies" placeholder="e.g. Acme Tech" required />
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="meetingType">Meeting type</label>
+            <select id="meetingType">
+              <option value="">Select…</option>
+              <option value="Discovery">Discovery</option>
+              <option value="Demo">Demo</option>
+              <option value="Follow-up">Follow-up</option>
+              <option value="Proposal">Proposal</option>
+              <option value="Negotiation">Negotiation</option>
+              <option value="Check-in">Check-in</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="meetingDate">Date</label>
+            <input id="meetingDate" type="date" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="summary">Meeting summary <span class="tag-optional">required</span></label>
+          <textarea id="summary" rows="3" placeholder="What happened in this interaction?"></textarea>
+        </div>
+
+        <div class="field">
+          <label for="requirements">Requirements &amp; needs</label>
+          <textarea id="requirements" rows="2" placeholder="What does the prospect need?"></textarea>
+        </div>
+
+        <div class="field">
+          <label for="objections">Objections &amp; blockers</label>
+          <textarea id="objections" rows="2" placeholder="Concerns or red flags raised?"></textarea>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="budget">Budget</label>
+            <input id="budget" type="text" placeholder="e.g. ₹50,000/yr" />
+          </div>
+          <div class="field">
+            <label for="competitors">Competitors</label>
+            <input id="competitors" type="text" placeholder="e.g. Freshdesk" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="stakeholders">Stakeholders</label>
+          <input id="stakeholders" type="text" placeholder="e.g. Priya (Tech lead), VP Ops" />
+        </div>
+
+        <div class="field">
+          <label for="commitments">Commitments &amp; next steps</label>
+          <textarea id="commitments" rows="2" placeholder="What was promised? What's next?"></textarea>
+        </div>
+
+        <button type="submit" id="retainBtn" class="btn-primary">
+          <span class="btn-icon">↗</span> Save to Memory
+        </button>
+        <div id="retainMsg" class="inline-msg" aria-live="polite"></div>
+      </form>
+
+    </aside>
+
+    <!-- ════════════════════════ MAIN CONTENT ════════════════════════ -->
+    <main class="main-content">
+
+      <!-- ── Brief Generator ── -->
+      <section class="brief-section">
+        <div class="panel-header">
+          <div class="section-number">02</div>
+          <div>
+            <h2 class="panel-title-text">Generate DealBrief</h2>
+            <p class="panel-subtitle">Recall memory → AI brief</p>
+          </div>
+          <div id="memoryActiveBadge" class="memory-active-badge hidden">
+            <span class="pulse-ring"></span>
+            <span class="pulse-dot"></span>
+            MEMORY ACTIVE
+          </div>
+        </div>
+
+        <div class="brief-controls">
+          <div class="field-row">
+            <div class="field">
+              <label for="briefProspect">Prospect</label>
+              <input id="briefProspect" type="text" value="Rahul Sharma" placeholder="Prospect name" />
+            </div>
+            <div class="field">
+              <label for="briefCompany">Company</label>
+              <input id="briefCompany" type="text" value="Acme Technologies" placeholder="Company name" />
+            </div>
+          </div>
+          <div class="field">
+            <label for="question">Your question</label>
+            <textarea id="question" rows="2" placeholder="What should I know before my next call?">What should I know before my next call with this prospect?</textarea>
+          </div>
+          <div class="brief-actions">
+            <button id="briefBtn" class="btn-primary">
+              <span class="btn-icon">✦</span> Generate DealBrief
+            </button>
+            <button id="refreshMemBtn" class="btn-ghost">
+              ⟳ Recall Memory
+            </button>
+          </div>
+        </div>
+
+        <!-- DealBrief output -->
+        <div id="briefOutput" class="brief-output brief-output--empty">
+          <div class="empty-state">
+            <div class="empty-icon">✦</div>
+            <p>Your personalized DealBrief will appear here.</p>
+            <p class="empty-sub">Hindsight will retrieve relevant memory, then the AI generates the brief.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Memory Panel ── -->
+      <section class="memory-section">
+        <div class="memory-section-header">
+          <div class="panel-header" style="margin-bottom: 0">
+            <div class="section-number">03</div>
+            <div>
+              <h2 class="panel-title-text">Hindsight Memory</h2>
+              <p class="panel-subtitle">What the agent recalls</p>
+            </div>
+          </div>
+          <div id="memorySourceTag" class="source-tag hidden">SOURCE: <span id="memorySourceText">—</span></div>
+        </div>
+
+        <div id="memoriesGrid" class="memories-grid">
+          <div class="empty-memories">
+            <div class="empty-icon small">◎</div>
+            <p>No memories recalled yet.</p>
+            <p class="empty-sub">Log an interaction and click "Recall Memory".</p>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ════════════════════════ FOOTER ════════════════════════ -->
+  <footer class="app-footer">
+    <span>DealBrief AI</span>
+    <span class="dot">·</span>
+    <span>Built for Hack With Hyderabad 3.0</span>
+    <span class="dot">·</span>
+    <span>Persistent memory by <strong>Hindsight</strong></span>
+    <span class="dot">·</span>
+    <span id="footerMode" class="footer-mode">–</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
